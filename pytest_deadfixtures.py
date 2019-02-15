@@ -13,6 +13,10 @@ from _pytest.compat import getlocation
 DUPLICATE_FIXTURES_HEADLINE = '\n\nYou may have some duplicate fixtures:'
 UNUSED_FIXTURES_FOUND_HEADLINE = 'Hey there, I believe the following fixture(s) are not being used:'
 UNUSED_FIXTURES_NOT_FOUND_HEADLINE = 'Cool, every declared fixture is being used.'
+USED_FIXTURES_FOUND_HEADLINE = (
+    'Hey there, I believe the following fixture(s) are being used:'
+)
+USED_FIXTURES_NOT_FOUND_HEADLINE = 'We could not any fixtures being used'
 
 EXIT_CODE_ERROR = 11
 EXIT_CODE_SUCCESS = 0
@@ -25,6 +29,11 @@ AvailableFixture = namedtuple(
 CachedFixture = namedtuple(
     'CachedFixture',
     'fixturedef, relpath, result'
+)
+
+UsedFixture = namedtuple(
+    'UsedFixture',
+    'relpath, argname, fixturedef'
 )
 
 
@@ -44,6 +53,13 @@ def pytest_addoption(parser):
         default=False,
         help='Show duplicated fixtures'
     )
+    group.addoption(
+        '--used-fixtures',
+        action='store_true',
+        dest='usedfixtures',
+        default=False,
+        help='Show fixtures being used',
+    )
 
 
 def pytest_cmdline_main(config):
@@ -53,11 +69,21 @@ def pytest_cmdline_main(config):
         if _show_dead_fixtures(config):
             return EXIT_CODE_ERROR
         return EXIT_CODE_SUCCESS
+    elif config.option.usedfixtures:
+        if _show_used_fixtures(config):
+            return EXIT_CODE_ERROR
+        return EXIT_CODE_SUCCESS
 
 
 def _show_dead_fixtures(config):
     from _pytest.main import wrap_session
     return wrap_session(config, show_dead_fixtures)
+
+
+def _show_used_fixtures(config):
+    from _pytest.main import wrap_session
+
+    return wrap_session(config, show_used_fixtures)
 
 
 def get_best_relpath(func, curdir):
@@ -100,8 +126,10 @@ def get_fixtures(session):
     return available
 
 
-def get_used_fixturesdefs(session):
-    fixturesdefs = []
+def get_used_fixtures(session):
+    used = []
+    seen = set()
+    curdir = py.path.local()
     for test_function in session.items:
         try:
             info = test_function._fixtureinfo
@@ -115,8 +143,27 @@ def get_used_fixturesdefs(session):
         for _, fixturedefs in sorted(info.name2fixturedefs.items()):
             if fixturedefs is None:
                 continue
-            fixturesdefs.append(fixturedefs[-1])
-    return fixturesdefs
+
+            for fixturedef in fixturedefs:
+                loc = getlocation(fixturedef.func, curdir)
+                if (fixturedef.argname, loc) in seen:
+                    continue
+
+                seen.add((fixturedef.argname, loc))
+
+                module = fixturedef.func.__module__
+
+                if (
+                    not module.startswith("_pytest.") and
+                    not module.startswith("pytest_") and
+                    not ('site-packages' in loc)
+                ):
+                    used.append(
+                        UsedFixture(
+                            curdir.bestrelpath(loc), fixturedef.argname, fixturedef
+                        )
+                    )
+    return used
 
 
 def write_docstring(tw, doc):
@@ -202,11 +249,14 @@ def show_dead_fixtures(config, session):
     tw = _pytest.config.create_terminal_writer(config)
     show_fixture_doc = config.getvalue('show_fixture_doc')
 
-    used_fixtures = get_used_fixturesdefs(session)
+    used_fixturedefs = [f.fixturedef for f in get_used_fixtures(session)]
     available_fixtures = get_fixtures(session)
 
-    unused_fixtures = [fixture for fixture in available_fixtures
-                       if fixture.fixturedef not in used_fixtures]
+    unused_fixtures = [
+        fixture
+        for fixture in available_fixtures
+        if fixture.fixturedef not in used_fixturedefs
+    ]
 
     tw.line()
     if unused_fixtures:
@@ -215,3 +265,19 @@ def show_dead_fixtures(config, session):
     else:
         tw.line(UNUSED_FIXTURES_NOT_FOUND_HEADLINE, green=True)
     return unused_fixtures
+
+
+def show_used_fixtures(config, session):
+    session.perform_collect()
+    tw = _pytest.config.create_terminal_writer(config)
+    verbose = config.getvalue('verbose')
+
+    used_fixtures = get_used_fixtures(session)
+
+    tw.line()
+    if used_fixtures:
+        tw.line(USED_FIXTURES_FOUND_HEADLINE, green=True)
+        write_fixtures(tw, used_fixtures, verbose)
+    else:
+        tw.line(USED_FIXTURES_NOT_FOUND_HEADLINE, red=True)
+    return used_fixtures
